@@ -214,17 +214,66 @@ class TokenAnalyzer:
                             },
                         )
                     )
-            elif "EOF in multi-line string" in msg:
+            elif (
+                "unterminated string literal" in msg.lower()
+                or "unterminated triple-quoted string" in msg.lower()
+                or "eof in multi-line string" in msg.lower()
+                or "eol while scanning string literal" in msg.lower()
+            ):
+                det_line = erow
+                match_det = re.search(r"detected at line (\d+)", msg)
+                if match_det:
+                    det_line = int(match_det.group(1))
+
+                target_line = lines[det_line - 1] if 1 <= det_line <= len(lines) else line_content
+
+                quote_char = None
+                open_col = ecol or 1
+                i = 0
+                while i < len(target_line):
+                    ch = target_line[i]
+                    if ch == "\\" and quote_char:
+                        i += 2
+                        continue
+                    if ch in ('"', "'"):
+                        if i + 2 < len(target_line) and target_line[i : i + 3] == ch * 3:
+                            q = ch * 3
+                            if quote_char == q:
+                                quote_char = None
+                            elif quote_char is None:
+                                quote_char = q
+                                open_col = i + 1
+                            i += 3
+                            continue
+                        if quote_char == ch:
+                            quote_char = None
+                        elif quote_char is None:
+                            quote_char = ch
+                            open_col = i + 1
+                    i += 1
+
+                q_name = (
+                    "double quote ('\"')"
+                    if quote_char in ('"', '"""')
+                    else ("single quote ('\\'')" if quote_char in ("'", "'''") else "quotation mark")
+                )
+
                 errors.append(
                     DetectedError(
                         error_type="SyntaxError",
-                        message="Missing closing quotation mark or unclosed multi-line string literal.",
-                        line=erow,
-                        column=ecol or 1,
-                        source_snippet=line_content,
+                        message=f"Unterminated string literal: string opened with {q_name} at line {det_line}, column {open_col} was not closed.",
+                        line=det_line,
+                        column=open_col,
+                        source_snippet=target_line,
                         category="token",
                         severity="error",
-                        details={"issue": "unclosed_string", "raw_message": msg},
+                        details={
+                            "issue": "unclosed_string",
+                            "quote": quote_char or ('"' if '"' in target_line else "'"),
+                            "open_line": det_line,
+                            "open_col": open_col,
+                            "raw_message": msg,
+                        },
                     )
                 )
             elif "EOF in multi-line statement" in msg:
@@ -747,14 +796,16 @@ class ErrorExplainer:
                     confidence="High",
                     provider="local_heuristic",
                 )
-            if "quotation mark" in msg.lower() or "string" in msg.lower():
+            if "quotation mark" in msg.lower() or "string" in msg.lower() or (error.details and error.details.get("issue") == "unclosed_string"):
+                q_char = error.details.get("quote", '"') if error.details else ('"' if '"' in snippet else "'")
+                q_name = "double quote" if q_char in ('"', '"""') else "single quote"
                 return ExplanationResult(
-                    what="SyntaxError: Unclosed string literal or quotation mark.",
+                    what="SyntaxError: Unterminated string literal.",
                     where=where,
                     why="String values must be enclosed in matching single ('') or double (\"\") quotes.",
-                    cause="A string literal was started but never properly closed before the end of the line.",
+                    cause=f"A string was opened with a {q_name} ({q_char}) but not properly closed.",
                     affected=f"String literal on line {line}: `{snippet.strip()}`",
-                    how_to_fix="Add the matching quote character (' or \") at the end of the string.",
+                    how_to_fix=f"Add the closing {q_name} ({q_char}) before closing delimiters or at the end of the line.",
                     confidence="High",
                     provider="local_heuristic",
                 )
@@ -978,6 +1029,63 @@ class AutoFixer:
         return "".join(diff)
 
     @classmethod
+    def _fix_unclosed_string(
+        cls,
+        source_code: str,
+        line_idx: int,
+        quote_hint: Optional[str] = None,
+    ) -> Optional[tuple[str, str]]:
+        lines = source_code.splitlines()
+        if not (0 <= line_idx < len(lines)):
+            return None
+        target = lines[line_idx]
+
+        quotes_to_try: list[str] = []
+        if quote_hint in ('"', "'", '"""', "'''"):
+            quotes_to_try.append(quote_hint)
+        if target.count('"') % 2 != 0:
+            quotes_to_try.append('"')
+        if target.count("'") % 2 != 0:
+            quotes_to_try.append("'")
+        for q in ('"', "'"):
+            if q not in quotes_to_try:
+                quotes_to_try.append(q)
+
+        candidates: list[tuple[str, str]] = []
+        for q in quotes_to_try:
+            match_trailing = re.search(r"([\s,;:)}\]]+)$", target)
+            if match_trailing:
+                pos = match_trailing.start()
+                cand_line = target[:pos] + q + target[pos:]
+                candidates.append((cand_line, f"Closed string literal with {q} before trailing delimiter."))
+
+            cand_line_end = target.rstrip() + q
+            candidates.append((cand_line_end, f"Added missing closing quote {q} at end of statement."))
+
+            open_parens = max(0, target.count("(") - target.count(")"))
+            open_squares = max(0, target.count("[") - target.count("]"))
+            open_curlies = max(0, target.count("{") - target.count("}"))
+            brackets = (")" * open_parens) + ("]" * open_squares) + ("}" * open_curlies)
+            if brackets:
+                cand_combined = target.rstrip() + q + brackets
+                candidates.append((cand_combined, f"Closed string with {q} and completed matching brackets."))
+
+            for idx in range(len(target) - 1, -1, -1):
+                if target[idx] in (")", "]", "}", ",", ":"):
+                    cand_mid = target[:idx] + q + target[idx:]
+                    candidates.append((cand_mid, f"Closed string with {q}."))
+
+        for cand_line, desc in candidates:
+            cand_lines = list(lines)
+            cand_lines[line_idx] = cand_line
+            candidate_code = "\n".join(cand_lines) + ("\n" if source_code.endswith("\n") else "")
+            val_ok, note = cls.validate_candidate(candidate_code)
+            if val_ok:
+                return candidate_code, desc
+
+        return None
+
+    @classmethod
     def _generate_local_fix(cls, error: DetectedError, source_code: str) -> FixResult:
         lines = source_code.splitlines()
         line_idx = error.line - 1 if 1 <= error.line <= len(lines) else None
@@ -1044,27 +1152,30 @@ class AutoFixer:
                         validation_notes=note,
                     )
 
-        # Case 4: Missing closing quote
-        if error.details and error.details.get("issue") == "unclosed_string" and line_idx is not None:
-            target = lines[line_idx]
-            quote_char = '"' if target.count('"') % 2 != 0 else ("'" if target.count("'") % 2 != 0 else None)
-            if quote_char:
-                candidate_lines = list(lines)
-                candidate_lines[line_idx] = target + quote_char
-                candidate = "\n".join(candidate_lines) + ("\n" if source_code.endswith("\n") else "")
-                val_ok, note = cls.validate_candidate(candidate)
-                if val_ok:
-                    return FixResult(
-                        is_valid=True,
-                        original_code=source_code,
-                        fixed_code=candidate,
-                        diff=cls._create_diff(source_code, candidate),
-                        changes_description=f"Added matching closing quotation mark ({quote_char}) on line {error.line}.",
-                        requires_user_review=False,
-                        validation_notes=note,
-                    )
+        # Case 4: Missing closing quote in string literal (unterminated string literal)
+        is_string_err = (
+            (error.details and error.details.get("issue") == "unclosed_string")
+            or "unterminated string" in error.message.lower()
+            or "unclosed string" in error.message.lower()
+            or "quotation mark" in error.message.lower()
+            or (error.details and "unterminated string" in str(error.details.get("raw_message", "")).lower())
+        )
+        if is_string_err and line_idx is not None:
+            quote_hint = error.details.get("quote") if error.details else None
+            fix_res = cls._fix_unclosed_string(source_code, line_idx, quote_hint)
+            if fix_res:
+                fixed_code, desc = fix_res
+                return FixResult(
+                    is_valid=True,
+                    original_code=source_code,
+                    fixed_code=fixed_code,
+                    diff=cls._create_diff(source_code, fixed_code),
+                    changes_description=desc,
+                    requires_user_review=False,
+                    validation_notes="Code passed AST and compile validation successfully.",
+                )
 
-        # Case 5: NameError - misspelled identifier
+        # Case 5: NameError - missing import or misspelled identifier
         if error.error_type == "NameError" and line_idx is not None:
             unknown_name = None
             if error.details and "name" in error.details:
@@ -1073,6 +1184,25 @@ class AutoFixer:
                 match = re.search(r"name ['\"]([^'\"]+)['\"]", error.message)
                 if match:
                     unknown_name = match.group(1)
+
+            COMMON_STDLIB = {
+                "math", "sys", "os", "json", "random", "re", "time", "datetime",
+                "pathlib", "collections", "itertools", "functools", "urllib", "sqlite3",
+                "csv", "hashlib", "copy", "shutil", "io", "string", "subprocess", "logging"
+            }
+            if unknown_name in COMMON_STDLIB:
+                candidate = f"import {unknown_name}\n" + source_code
+                val_ok, note = cls.validate_candidate(candidate)
+                if val_ok:
+                    return FixResult(
+                        is_valid=True,
+                        original_code=source_code,
+                        fixed_code=candidate,
+                        diff=cls._create_diff(source_code, candidate),
+                        changes_description=f"Added missing standard library import 'import {unknown_name}'.",
+                        requires_user_review=False,
+                        validation_notes=note,
+                    )
 
             if unknown_name:
                 identifiers = set(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", source_code))
@@ -1098,7 +1228,76 @@ class AutoFixer:
                             validation_notes=note,
                         )
 
-        # Case 6: ZeroDivisionError
+        # Case 6: SyntaxError - Assignment in condition (if x = 5 -> if x == 5)
+        if error.error_type == "SyntaxError" and line_idx is not None:
+            target = lines[line_idx]
+            match_assign = re.search(r"^(?P<indent>\s*(?:if|elif|while)\s+)(?P<expr>[^=:\n]+)=(?P<rest>[^=:\n]+:.*)$", target)
+            if match_assign:
+                corrected_line = match_assign.group("indent") + match_assign.group("expr").rstrip() + " == " + match_assign.group("rest").lstrip()
+                cand_lines = list(lines)
+                cand_lines[line_idx] = corrected_line
+                candidate = "\n".join(cand_lines) + ("\n" if source_code.endswith("\n") else "")
+                val_ok, note = cls.validate_candidate(candidate)
+                if val_ok:
+                    return FixResult(
+                        is_valid=True,
+                        original_code=source_code,
+                        fixed_code=candidate,
+                        diff=cls._create_diff(source_code, candidate),
+                        changes_description=f"Replaced assignment '=' with comparison '==' in condition on line {error.line}.",
+                        requires_user_review=False,
+                        validation_notes=note,
+                    )
+
+        # Case 7: SyntaxError - C-style logical operators (&&, ||, ===, !==, true, false, null)
+        if error.error_type == "SyntaxError" and line_idx is not None:
+            target = lines[line_idx]
+            corrected = target
+            corrected = re.sub(r"===+", "==", corrected)
+            corrected = re.sub(r"!==+", "!=", corrected)
+            corrected = re.sub(r"\s*&&\s*", " and ", corrected)
+            corrected = re.sub(r"\s*\|\|\s*", " or ", corrected)
+            corrected = re.sub(r"\btrue\b", "True", corrected)
+            corrected = re.sub(r"\bfalse\b", "False", corrected)
+            corrected = re.sub(r"\bnull\b", "None", corrected)
+            if corrected != target:
+                cand_lines = list(lines)
+                cand_lines[line_idx] = corrected
+                candidate = "\n".join(cand_lines) + ("\n" if source_code.endswith("\n") else "")
+                val_ok, note = cls.validate_candidate(candidate)
+                if val_ok:
+                    return FixResult(
+                        is_valid=True,
+                        original_code=source_code,
+                        fixed_code=candidate,
+                        diff=cls._create_diff(source_code, candidate),
+                        changes_description=f"Converted C-style logical operators to Python equivalents ('and', 'or', '==') on line {error.line}.",
+                        requires_user_review=False,
+                        validation_notes=note,
+                    )
+
+        # Case 8: SyntaxError - Python 2 style print statement without parens
+        if error.error_type == "SyntaxError" and line_idx is not None:
+            target = lines[line_idx]
+            match_print = re.match(r"^(?P<indent>\s*)print\s+(?P<args>[^()]+)$", target)
+            if match_print:
+                corrected_line = f"{match_print.group('indent')}print({match_print.group('args').strip()})"
+                cand_lines = list(lines)
+                cand_lines[line_idx] = corrected_line
+                candidate = "\n".join(cand_lines) + ("\n" if source_code.endswith("\n") else "")
+                val_ok, note = cls.validate_candidate(candidate)
+                if val_ok:
+                    return FixResult(
+                        is_valid=True,
+                        original_code=source_code,
+                        fixed_code=candidate,
+                        diff=cls._create_diff(source_code, candidate),
+                        changes_description=f"Wrapped print statement arguments in parentheses on line {error.line}.",
+                        requires_user_review=False,
+                        validation_notes=note,
+                    )
+
+        # Case 9: ZeroDivisionError
         if error.error_type == "ZeroDivisionError" and line_idx is not None:
             target_line = lines[line_idx]
             match = re.search(r"(?P<num>[A-Za-z0-9_.]+)\s*/\s*(?P<denom>[A-Za-z0-9_.]+)", target_line)
@@ -1121,6 +1320,111 @@ class AutoFixer:
                         requires_user_review=True,
                         validation_notes="Please confirm whether returning 0 when divisor is zero matches your application logic.",
                     )
+
+        # Case 10: TypeError - string concatenation with int/float
+        if error.error_type == "TypeError" and line_idx is not None:
+            target = lines[line_idx]
+            if "can only concatenate str" in error.message or "unsupported operand type(s) for +" in error.message:
+                match_plus = re.search(r"(\+\s*)([A-Za-z_][A-Za-z0-9_.]*)", target)
+                if match_plus:
+                    prefix = target[: match_plus.start()]
+                    var = match_plus.group(2)
+                    suffix = target[match_plus.end() :]
+                    corrected_line = f"{prefix}+ str({var}){suffix}"
+                    cand_lines = list(lines)
+                    cand_lines[line_idx] = corrected_line
+                    candidate = "\n".join(cand_lines) + ("\n" if source_code.endswith("\n") else "")
+                    val_ok, note = cls.validate_candidate(candidate)
+                    if val_ok:
+                        return FixResult(
+                            is_valid=True,
+                            original_code=source_code,
+                            fixed_code=candidate,
+                            diff=cls._create_diff(source_code, candidate),
+                            changes_description=f"Wrapped non-string variable '{var}' in str() for safe concatenation on line {error.line}.",
+                            requires_user_review=False,
+                            validation_notes=note,
+                        )
+
+        # Case 11: KeyError - dictionary key lookup
+        if error.error_type == "KeyError" and line_idx is not None:
+            target = lines[line_idx]
+            match_key = re.search(r"(\b[A-Za-z_][A-Za-z0-9_.]*)\[(['\"][^'\"]+['\"])\]", target)
+            if match_key:
+                dict_name = match_key.group(1)
+                key_expr = match_key.group(2)
+                replacement = f"{dict_name}.get({key_expr})"
+                corrected_line = target[: match_key.start()] + replacement + target[match_key.end() :]
+                cand_lines = list(lines)
+                cand_lines[line_idx] = corrected_line
+                candidate = "\n".join(cand_lines) + ("\n" if source_code.endswith("\n") else "")
+                val_ok, note = cls.validate_candidate(candidate)
+                if val_ok:
+                    return FixResult(
+                        is_valid=True,
+                        original_code=source_code,
+                        fixed_code=candidate,
+                        diff=cls._create_diff(source_code, candidate),
+                        changes_description=f"Replaced direct dictionary key lookup {dict_name}[{key_expr}] with safe {dict_name}.get({key_expr}) on line {error.line}.",
+                        requires_user_review=True,
+                        validation_notes="Returns None instead of raising KeyError if key is missing.",
+                    )
+
+        # Case 12: IndexError - list index out of range
+        if error.error_type == "IndexError" and line_idx is not None:
+            target = lines[line_idx]
+            match_idx = re.search(r"(\b[A-Za-z_][A-Za-z0-9_.]*)\[([A-Za-z0-9_.]+)\]", target)
+            if match_idx:
+                list_name = match_idx.group(1)
+                idx_expr = match_idx.group(2)
+                safe_expr = f"({list_name}[{idx_expr}] if len({list_name}) > {idx_expr} else None)"
+                corrected_line = target[: match_idx.start()] + safe_expr + target[match_idx.end() :]
+                cand_lines = list(lines)
+                cand_lines[line_idx] = corrected_line
+                candidate = "\n".join(cand_lines) + ("\n" if source_code.endswith("\n") else "")
+                val_ok, note = cls.validate_candidate(candidate)
+                if val_ok:
+                    return FixResult(
+                        is_valid=True,
+                        original_code=source_code,
+                        fixed_code=candidate,
+                        diff=cls._create_diff(source_code, candidate),
+                        changes_description=f"Added bounds check guard for {list_name}[{idx_expr}] on line {error.line}.",
+                        requires_user_review=True,
+                        validation_notes="Guards against IndexError by validating index against list length.",
+                    )
+
+        # Case 13: AttributeError - misspelled method or attribute
+        if error.error_type == "AttributeError" and line_idx is not None:
+            target = lines[line_idx]
+            match_attr = re.search(r"object has no attribute ['\"]([^'\"]+)['\"]", error.message)
+            if match_attr:
+                unknown_attr = match_attr.group(1)
+                KNOWN_METHODS = [
+                    "append", "extend", "insert", "remove", "pop", "clear", "index", "count",
+                    "sort", "reverse", "copy", "strip", "lstrip", "rstrip", "lower", "upper",
+                    "capitalize", "title", "replace", "split", "rsplit", "join", "find",
+                    "rfind", "startswith", "endswith", "isalpha", "isdigit", "isalnum",
+                    "keys", "values", "items", "get", "update", "setdefault", "add", "discard"
+                ]
+                matches = difflib.get_close_matches(unknown_attr, KNOWN_METHODS, n=1, cutoff=0.6)
+                if matches:
+                    replacement = matches[0]
+                    corrected_line = re.sub(rf"\b{re.escape(unknown_attr)}\b", replacement, target, count=1)
+                    cand_lines = list(lines)
+                    cand_lines[line_idx] = corrected_line
+                    candidate = "\n".join(cand_lines) + ("\n" if source_code.endswith("\n") else "")
+                    val_ok, note = cls.validate_candidate(candidate)
+                    if val_ok:
+                        return FixResult(
+                            is_valid=True,
+                            original_code=source_code,
+                            fixed_code=candidate,
+                            diff=cls._create_diff(source_code, candidate),
+                            changes_description=f"Corrected misspelled method '.{unknown_attr}' to '.{replacement}' on line {error.line}.",
+                            requires_user_review=False,
+                            validation_notes=note,
+                        )
 
         return FixResult(
             is_valid=False,
@@ -1774,7 +2078,7 @@ input:checked + .slider:before { transform: translateX(12px); }
 .toolbar { height: 42px; background-color: #1f1f1f; border-bottom: 1px solid var(--border-color); display: flex; align-items: center; gap: 8px; padding: 0 10px; flex-shrink: 0; }
 .editor-wrapper { display: flex; flex: 1; min-height: 0; background-color: var(--bg-editor); overflow: hidden; }
 .line-numbers { width: 44px; background-color: #1e1e1e; border-right: 1px solid #2d2d2d; color: var(--text-muted); font-family: var(--font-code); font-size: 13px; line-height: 20px; text-align: right; padding: 10px 8px 10px 0; overflow: hidden; white-space: pre-wrap; }
-.line-numbers .error-marker { color: var(--danger-red); font-weight: bold; }
+.line-numbers .error-marker { color: #ff5555 !important; font-weight: 700; background: rgba(255, 85, 85, 0.22); border-left: 3px solid #ff5555; padding-left: 2px; display: block; }
 #codeEditor { flex: 1; background-color: var(--bg-editor); color: var(--text-code); font-family: var(--font-code); font-size: 13px; line-height: 20px; padding: 10px; border: none; outline: none; resize: none; white-space: pre; overflow: auto; tab-size: 4; }
 .editor-footer { height: 24px; background-color: #141414; border-top: 1px solid var(--border-color); display: flex; align-items: center; justify-content: flex-end; gap: 16px; padding: 0 12px; font-size: 11px; color: var(--text-muted); }
 .right-panel { display: flex; flex-direction: column; background-color: var(--bg-dark); }
@@ -1937,6 +2241,20 @@ document.addEventListener("DOMContentLoaded", () => {
     cursorPos.textContent = `Ln ${lines.length}, Col ${lines[lines.length - 1].length + 1}`;
   }
 
+  function highlightAndScrollToLine(lineNumber) {
+    if (!lineNumber || lineNumber < 1) return;
+    const lines = codeEditor.value.split("\\n");
+    let charOffset = 0;
+    for (let i = 0; i < lineNumber - 1 && i < lines.length; i++) {
+      charOffset += lines[i].length + 1;
+    }
+    const lineEnd = charOffset + (lines[lineNumber - 1] ? lines[lineNumber - 1].length : 0);
+    codeEditor.focus();
+    codeEditor.setSelectionRange(charOffset, lineEnd);
+    codeEditor.scrollTop = Math.max(0, (lineNumber - 3) * 20);
+    lineNumbers.scrollTop = codeEditor.scrollTop;
+  }
+
   codeEditor.addEventListener("input", () => { updateLineNumbers(activeErrorLine); updateCursorPosition(); });
   codeEditor.addEventListener("keyup", updateCursorPosition);
   codeEditor.addEventListener("click", updateCursorPosition);
@@ -2024,6 +2342,7 @@ document.addEventListener("DOMContentLoaded", () => {
           setStatus(`Error: ${primary.error_type}`, "error");
           activeErrorLine = primary.line;
           updateLineNumbers(activeErrorLine);
+          highlightAndScrollToLine(primary.line);
 
           badgeErrorType.textContent = primary.error_type;
           badgeErrorType.className = "badge badge-error";
@@ -2260,8 +2579,19 @@ document.addEventListener("DOMContentLoaded", () => {
 # =============================================================================
 
 app = Flask("SEDS_Standalone")
-CORS(app)
+cors_origins_env = os.getenv("CORS_ORIGINS", "*").strip()
+if cors_origins_env == "*":
+    CORS(app, resources={r"/api/*": {"origins": "*"}, r"/healthz": {"origins": "*"}})
+else:
+    allowed_list = [origin.strip() for origin in cors_origins_env.split(",") if origin.strip()]
+    CORS(app, resources={r"/api/*": {"origins": allowed_list}, r"/healthz": {"origins": allowed_list}})
+
 Database.init_db()
+
+
+@app.route("/healthz", methods=["GET"])
+def api_health():
+    return jsonify({"status": "healthy", "service": "SEDS Standalone", "version": "2.0.0"}), 200
 
 
 @app.route("/")
@@ -2622,7 +2952,7 @@ def main():
     print("=" * 65)
 
     Database.init_db()
-    port = int(os.getenv("SEDS_PORT", "5000"))
+    port = int(os.getenv("PORT", os.getenv("SEDS_PORT", "5000")))
     host = os.getenv("SEDS_HOST", "0.0.0.0")
     url = f"http://127.0.0.1:{port}"
 
